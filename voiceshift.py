@@ -210,6 +210,7 @@ class VoiceTransformer:
                     text=iter([text]),
                     model_id=self.config.eleven_model_id,
                     output_format=ELEVEN_PCM_FORMAT,
+                    voice_settings=None,
                 )
             else:
                 pcm_iter = self.eleven_client.text_to_speech.convert_as_stream(
