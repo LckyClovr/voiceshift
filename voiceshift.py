@@ -147,9 +147,15 @@ class VoiceTransformer:
         self.in_speech = False
         self.processing_lock = asyncio.Lock()
 
+        # Suppresses mic input while TTS is playing so the synthesized voice
+        # doesn't get fed back through the mic and re-transcribed.
+        self.muting_until = 0.0
+
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             print(f"Audio status: {status}")
+        if time.time() < self.muting_until:
+            return
         self.audio_queue.put(indata.copy())
 
     def stream_pcm_playback(self, stream, pcm_chunks, t_request_sent: float) -> None:
@@ -174,6 +180,12 @@ class VoiceTransformer:
 
     async def synthesize_and_play_elevenlabs(self, text: str) -> None:
         assert self.eleven_client is not None
+        # Mute the mic for the full TTS lifecycle. We extend muting_until
+        # while playback runs and add a small grace period after, so the
+        # tail of the synthesized voice can't bleed into the mic and
+        # trigger a feedback loop.
+        self.muting_until = time.time() + 60  # extended each chunk below
+
         # Pre-open the output device so playback starts the instant the
         # first network chunk arrives — opening lazily on first write()
         # would add 50–150ms on Windows.
@@ -201,6 +213,19 @@ class VoiceTransformer:
         finally:
             out_stream.stop()
             out_stream.close()
+            # Grace period after playback ends: drop any mic frames that
+            # are still echoing the tail of the synthesized audio, then
+            # also discard anything queued during muting so the next loop
+            # iteration starts clean.
+            self.muting_until = time.time() + 0.3
+            await asyncio.sleep(0.3)
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.vad_buffer = []
+            self.silence_buffer = []
 
     async def synthesize_and_play_edge(self, text: str) -> None:
         tts = edge_tts.Communicate(text, self.config.edge_voice)
