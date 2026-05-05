@@ -42,6 +42,7 @@ class Config:
     whisper_model: str = "tiny.en"
     edge_voice: str = "en-US-GuyNeural"
     use_elevenlabs: bool = True
+    use_realtime: bool = True
     eleven_voice_id: str = ""
     eleven_model_id: str = "eleven_flash_v2_5"
     eleven_api_key: str = ""
@@ -67,6 +68,7 @@ def load_config() -> Config:
         whisper_model=os.environ.get("WHISPER_MODEL", "tiny.en"),
         edge_voice=os.environ.get("EDGE_VOICE", "en-US-GuyNeural"),
         use_elevenlabs=os.environ.get("USE_ELEVENLABS", "true").lower() == "true",
+        use_realtime=os.environ.get("USE_REALTIME", "true").lower() == "true",
         eleven_voice_id=os.environ.get("ELEVEN_VOICE_ID", ""),
         eleven_model_id=os.environ.get("ELEVEN_MODEL_ID", "eleven_flash_v2_5"),
         eleven_api_key=os.environ.get("ELEVEN_API_KEY", ""),
@@ -199,12 +201,23 @@ class VoiceTransformer:
 
         try:
             t_request = time.time()
-            pcm_iter = self.eleven_client.text_to_speech.convert_as_stream(
-                text=text,
-                voice_id=self.voice_id,
-                model_id=self.config.eleven_model_id,
-                output_format=ELEVEN_PCM_FORMAT,
-            )
+            if self.config.use_realtime:
+                # Websocket-based realtime API. text is an iterator so the
+                # SDK can stream tokens — we send the full utterance as a
+                # single chunk and close.
+                pcm_iter = self.eleven_client.text_to_speech.convert_realtime(
+                    self.voice_id,
+                    text=iter([text]),
+                    model_id=self.config.eleven_model_id,
+                    output_format=ELEVEN_PCM_FORMAT,
+                )
+            else:
+                pcm_iter = self.eleven_client.text_to_speech.convert_as_stream(
+                    text=text,
+                    voice_id=self.voice_id,
+                    model_id=self.config.eleven_model_id,
+                    output_format=ELEVEN_PCM_FORMAT,
+                )
             # Run the blocking iterator in a worker thread so the event loop
             # stays responsive to incoming microphone audio.
             await asyncio.to_thread(
