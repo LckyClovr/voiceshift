@@ -152,40 +152,55 @@ class VoiceTransformer:
             print(f"Audio status: {status}")
         self.audio_queue.put(indata.copy())
 
-    def stream_pcm_playback(self, pcm_chunks) -> None:
-        """Stream raw 16-bit mono PCM chunks straight to the output device.
+    def stream_pcm_playback(self, stream, pcm_chunks, t_request_sent: float) -> None:
+        """Pump PCM chunks from the network into a pre-opened output stream.
 
-        First audio is heard as soon as the network delivers the first chunk,
-        which is the single biggest end-to-end latency win.
+        The output stream is opened *before* the network request goes out so
+        the device is already hot when the first chunk lands.
         """
+        first_chunk_logged = False
         try:
-            with sd.RawOutputStream(
-                samplerate=ELEVEN_PCM_SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                device=self.output_device_idx,
-            ) as stream:
-                for chunk in pcm_chunks:
-                    if chunk:
-                        stream.write(chunk)
+            for chunk in pcm_chunks:
+                if not chunk:
+                    continue
+                if not first_chunk_logged:
+                    ttfa_ms = (time.time() - t_request_sent) * 1000
+                    print(f"  Time-to-first-audio: {ttfa_ms:.0f}ms")
+                    first_chunk_logged = True
+                stream.write(chunk)
         except Exception as e:
             print(f"Playback error: {e}")
             traceback.print_exc()
 
     async def synthesize_and_play_elevenlabs(self, text: str) -> None:
         assert self.eleven_client is not None
-        # convert() in current ElevenLabs SDK versions already returns a
-        # chunk iterator — no separate .stream() method is needed. Requesting
-        # PCM avoids an MP3 decode round-trip on the way to playback.
-        pcm_iter = self.eleven_client.text_to_speech.convert(
-            text=text,
-            voice_id=self.voice_id,
-            model_id=self.config.eleven_model_id,
-            output_format=ELEVEN_PCM_FORMAT,
+        # Pre-open the output device so playback starts the instant the
+        # first network chunk arrives — opening lazily on first write()
+        # would add 50–150ms on Windows.
+        out_stream = sd.RawOutputStream(
+            samplerate=ELEVEN_PCM_SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            device=self.output_device_idx,
         )
-        # Run the blocking iterator + playback in a worker thread so the
-        # event loop stays responsive to incoming audio.
-        await asyncio.to_thread(self.stream_pcm_playback, pcm_iter)
+        out_stream.start()
+
+        try:
+            t_request = time.time()
+            pcm_iter = self.eleven_client.text_to_speech.convert_as_stream(
+                text=text,
+                voice_id=self.voice_id,
+                model_id=self.config.eleven_model_id,
+                output_format=ELEVEN_PCM_FORMAT,
+            )
+            # Run the blocking iterator in a worker thread so the event loop
+            # stays responsive to incoming microphone audio.
+            await asyncio.to_thread(
+                self.stream_pcm_playback, out_stream, pcm_iter, t_request
+            )
+        finally:
+            out_stream.stop()
+            out_stream.close()
 
     async def synthesize_and_play_edge(self, text: str) -> None:
         tts = edge_tts.Communicate(text, self.config.edge_voice)
