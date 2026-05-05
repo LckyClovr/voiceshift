@@ -174,7 +174,10 @@ class VoiceTransformer:
 
     async def synthesize_and_play_elevenlabs(self, text: str) -> None:
         assert self.eleven_client is not None
-        pcm_iter = self.eleven_client.text_to_speech.stream(
+        # convert() in current ElevenLabs SDK versions already returns a
+        # chunk iterator — no separate .stream() method is needed. Requesting
+        # PCM avoids an MP3 decode round-trip on the way to playback.
+        pcm_iter = self.eleven_client.text_to_speech.convert(
             text=text,
             voice_id=self.voice_id,
             model_id=self.config.eleven_model_id,
