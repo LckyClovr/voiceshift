@@ -18,6 +18,12 @@ import edge_tts
 from elevenlabs.client import ElevenLabs
 
 
+# Native sample rate of the ElevenLabs PCM output we request.
+# Keeping it at 22050 minimizes bandwidth without audible quality loss for speech.
+ELEVEN_PCM_SAMPLE_RATE = 22050
+ELEVEN_PCM_FORMAT = "pcm_22050"
+
+
 @dataclass
 class Voice:
     name: str
@@ -31,12 +37,13 @@ class Config:
     rolling_buffer_seconds: int = 4
     vad_threshold: float = 0.4
     min_speech_duration: float = 0.2
-    buffer_before_speech: float = 0.75
+    buffer_before_speech: float = 0.3
+    silence_end_ms: int = 350
     whisper_model: str = "tiny.en"
     edge_voice: str = "en-US-GuyNeural"
     use_elevenlabs: bool = True
     eleven_voice_id: str = ""
-    eleven_model_id: str = "eleven_multilingual_v2"
+    eleven_model_id: str = "eleven_flash_v2_5"
     eleven_api_key: str = ""
     voices: list[Voice] = field(default_factory=list)
 
@@ -61,9 +68,10 @@ def load_config() -> Config:
         edge_voice=os.environ.get("EDGE_VOICE", "en-US-GuyNeural"),
         use_elevenlabs=os.environ.get("USE_ELEVENLABS", "true").lower() == "true",
         eleven_voice_id=os.environ.get("ELEVEN_VOICE_ID", ""),
-        eleven_model_id=os.environ.get("ELEVEN_MODEL_ID", "eleven_multilingual_v2"),
+        eleven_model_id=os.environ.get("ELEVEN_MODEL_ID", "eleven_flash_v2_5"),
         eleven_api_key=os.environ.get("ELEVEN_API_KEY", ""),
         voices=parse_voices(os.environ.get("ELEVEN_VOICES", "")),
+        silence_end_ms=int(os.environ.get("SILENCE_END_MS", "350")),
     )
 
 
@@ -135,8 +143,9 @@ class VoiceTransformer:
         self.audio_queue: queue.Queue = queue.Queue()
         self.vad_buffer: list[np.ndarray] = []
         self.silence_buffer: list[np.ndarray] = []
-        self.is_speech_active = False
-        self.speech_start_time = 0.0
+
+        self.in_speech = False
+        self.silent_blocks_since_speech = 0
         self.processing_lock = asyncio.Lock()
 
     def audio_callback(self, indata, frames, time_info, status):
@@ -144,48 +153,71 @@ class VoiceTransformer:
             print(f"Audio status: {status}")
         self.audio_queue.put(indata.copy())
 
-    def play_audio_bytes(self, audio_bytes: bytes) -> None:
+    def stream_pcm_playback(self, pcm_chunks) -> None:
+        """Stream raw 16-bit mono PCM chunks straight to the output device.
+
+        First audio is heard as soon as the network delivers the first chunk,
+        which is the single biggest end-to-end latency win.
+        """
         try:
-            data, fs = sf.read(io.BytesIO(audio_bytes), dtype="float32")
-            sd.play(data, fs, device=self.output_device_idx)
-            sd.wait()
+            with sd.RawOutputStream(
+                samplerate=ELEVEN_PCM_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                device=self.output_device_idx,
+            ) as stream:
+                for chunk in pcm_chunks:
+                    if chunk:
+                        stream.write(chunk)
         except Exception as e:
             print(f"Playback error: {e}")
             traceback.print_exc()
 
-    async def synthesize_elevenlabs(self, text: str) -> bytes:
+    async def synthesize_and_play_elevenlabs(self, text: str) -> None:
         assert self.eleven_client is not None
-        audio_generator = self.eleven_client.text_to_speech.convert(
+        pcm_iter = self.eleven_client.text_to_speech.stream(
             text=text,
             voice_id=self.voice_id,
             model_id=self.config.eleven_model_id,
+            output_format=ELEVEN_PCM_FORMAT,
         )
-        return b"".join(audio_generator)
+        # Run the blocking iterator + playback in a worker thread so the
+        # event loop stays responsive to incoming audio.
+        await asyncio.to_thread(self.stream_pcm_playback, pcm_iter)
 
-    async def synthesize_edge(self, text: str) -> bytes:
+    async def synthesize_and_play_edge(self, text: str) -> None:
         tts = edge_tts.Communicate(text, self.config.edge_voice)
         buf = io.BytesIO()
         async for chunk in tts.stream():
             if chunk["type"] == "audio":
                 buf.write(chunk["data"])
-        return buf.getvalue()
+        buf.seek(0)
+        data, fs = sf.read(buf, dtype="float32")
+        await asyncio.to_thread(self._play_decoded, data, fs)
+
+    def _play_decoded(self, data: np.ndarray, fs: int) -> None:
+        sd.play(data, fs, device=self.output_device_idx)
+        sd.wait()
 
     async def transcribe_and_speak(self, audio_np: np.ndarray) -> None:
         async with self.processing_lock:
             try:
+                t0 = time.time()
                 segments, _ = self.whisper.transcribe(audio_np, beam_size=1)
                 text = " ".join(seg.text.strip() for seg in segments).strip()
+                t_stt = time.time() - t0
                 if not text:
                     return
 
-                print(f"Transcribed: {text}")
+                print(f"Transcribed ({t_stt * 1000:.0f}ms): {text}")
 
+                t1 = time.time()
                 if self.config.use_elevenlabs:
-                    audio_data = await self.synthesize_elevenlabs(text)
+                    await self.synthesize_and_play_elevenlabs(text)
                 else:
-                    audio_data = await self.synthesize_edge(text)
-
-                self.play_audio_bytes(audio_data)
+                    await self.synthesize_and_play_edge(text)
+                t_tts = time.time() - t1
+                print(f"  TTS+playback: {t_tts * 1000:.0f}ms")
             except Exception:
                 print("Error in transcription/synthesis:")
                 traceback.print_exc()
@@ -194,6 +226,14 @@ class VoiceTransformer:
         cfg = self.config
         silence_buffer_size = int(cfg.buffer_before_speech / cfg.block_duration)
         rolling_buffer_blocks = int(cfg.rolling_buffer_seconds / cfg.block_duration)
+        silence_end_blocks = max(
+            1, int((cfg.silence_end_ms / 1000.0) / cfg.block_duration)
+        )
+        min_speech_blocks = max(
+            1, int(cfg.min_speech_duration / cfg.block_duration)
+        )
+
+        speech_block_count = 0
 
         print("Listening...")
         while True:
@@ -216,34 +256,45 @@ class VoiceTransformer:
                 if self.processing_lock.locked():
                     continue
 
-                audio_concat = np.concatenate(self.vad_buffer)
-                speech_segments = get_speech_timestamps(
-                    audio_concat,
-                    self.vad_model,
-                    sampling_rate=cfg.sample_rate,
-                    threshold=cfg.vad_threshold,
-                    return_seconds=True,
+                # Per-block VAD on just the latest chunk — this gives us a
+                # binary "is there speech in this block" signal we can use
+                # to detect the trailing-silence endpoint.
+                block_has_speech = bool(
+                    get_speech_timestamps(
+                        audio_mono,
+                        self.vad_model,
+                        sampling_rate=cfg.sample_rate,
+                        threshold=cfg.vad_threshold,
+                    )
                 )
 
-                if not speech_segments:
-                    self.is_speech_active = False
+                if block_has_speech:
+                    self.in_speech = True
+                    self.silent_blocks_since_speech = 0
+                    speech_block_count += 1
                     continue
 
-                seg = speech_segments[0]
-                start_time, end_time = seg["start"], seg["end"]
-
-                if not self.is_speech_active:
-                    self.is_speech_active = True
-                    self.speech_start_time = time.time()
+                if not self.in_speech:
                     continue
 
-                if (time.time() - self.speech_start_time) < cfg.min_speech_duration:
+                self.silent_blocks_since_speech += 1
+                if self.silent_blocks_since_speech < silence_end_blocks:
                     continue
 
-                self.is_speech_active = False
-                segment_audio = self._extract_segment(
-                    audio_concat, start_time, end_time
-                )
+                # Endpoint: we've seen enough trailing silence after speech.
+                if speech_block_count < min_speech_blocks:
+                    # Too short — likely a cough or a stray sound. Reset.
+                    self.in_speech = False
+                    self.silent_blocks_since_speech = 0
+                    speech_block_count = 0
+                    self.vad_buffer = []
+                    continue
+
+                self.in_speech = False
+                self.silent_blocks_since_speech = 0
+                speech_block_count = 0
+
+                segment_audio = self._extract_full_buffer()
                 asyncio.create_task(self.transcribe_and_speak(segment_audio))
                 self.vad_buffer = []
 
@@ -252,27 +303,27 @@ class VoiceTransformer:
                 traceback.print_exc()
                 await asyncio.sleep(0.1)
 
-    def _extract_segment(
-        self, audio_concat: np.ndarray, start_time: float, end_time: float
-    ) -> np.ndarray:
-        cfg = self.config
-        start_sample = max(
-            0,
-            int(start_time * cfg.sample_rate)
-            - int(cfg.buffer_before_speech * cfg.sample_rate),
-        )
-        end_sample = min(int(end_time * cfg.sample_rate), len(audio_concat))
+    def _extract_full_buffer(self) -> np.ndarray:
+        """Concatenate the pre-roll silence buffer + the rolling speech buffer.
 
-        if start_sample > 0:
-            return audio_concat[start_sample:end_sample]
-
-        silence_audio = np.concatenate(self.silence_buffer)
-        silence_needed = min(
-            len(silence_audio), int(cfg.buffer_before_speech * cfg.sample_rate)
+        The pre-roll prevents clipping the first phoneme; the rolling buffer
+        contains everything from speech start through the trailing silence.
+        """
+        prefix = (
+            np.concatenate(self.silence_buffer)
+            if self.silence_buffer
+            else np.zeros(0, dtype=np.float32)
         )
-        return np.concatenate(
-            [silence_audio[-silence_needed:], audio_concat[:end_sample]]
+        body = (
+            np.concatenate(self.vad_buffer)
+            if self.vad_buffer
+            else np.zeros(0, dtype=np.float32)
         )
+        prefix_samples = int(
+            self.config.buffer_before_speech * self.config.sample_rate
+        )
+        prefix = prefix[-prefix_samples:] if len(prefix) > prefix_samples else prefix
+        return np.concatenate([prefix, body])
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()

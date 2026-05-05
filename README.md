@@ -11,8 +11,11 @@ mic → InputStream → VAD (Silero) → Whisper STT → TTS (ElevenLabs / Edge)
 ```
 
 - **Streaming capture** in 0.25s blocks with a 4s rolling buffer.
-- **Pre-roll silence buffer** (0.75s) prepended to detected speech so the first phoneme is never clipped.
-- **Single-flight processing** — an `asyncio.Lock` ensures one utterance is fully synthesized and played before the next one is picked up.
+- **Pre-roll silence buffer** prepended to detected speech so the first phoneme is never clipped.
+- **Endpointing on trailing silence** — the moment you stop talking, the pipeline fires. No fixed wait.
+- **Streaming TTS + streaming playback** — PCM chunks from ElevenLabs are written straight to the output device as they arrive, so the first audio is heard within ~300ms of synthesis starting (no MP3 decode round-trip, no waiting for the full clip).
+- **`eleven_flash_v2_5`** by default — ElevenLabs' lowest-latency model.
+- **Single-flight processing** — an `asyncio.Lock` ensures one utterance is fully spoken before the next is picked up.
 - **GPU when available**, CPU fallback automatically.
 
 ## Setup
@@ -47,13 +50,14 @@ All settings are env vars (see `.env.example`):
 | `ELEVEN_API_KEY` | — | Required if `USE_ELEVENLABS=true` |
 | `ELEVEN_VOICES` | — | Comma-separated `name:id` pairs; preferred over `ELEVEN_VOICE_ID` |
 | `ELEVEN_VOICE_ID` | — | Fallback if `ELEVEN_VOICES` is empty |
-| `ELEVEN_MODEL_ID` | `eleven_multilingual_v2` | |
+| `ELEVEN_MODEL_ID` | `eleven_flash_v2_5` | `flash_v2_5` (fastest), `turbo_v2_5`, or `multilingual_v2` (highest fidelity) |
 | `USE_ELEVENLABS` | `true` | Set `false` to use Edge TTS instead |
 | `EDGE_VOICE` | `en-US-GuyNeural` | Used only with Edge TTS |
 | `WHISPER_MODEL` | `tiny.en` | `tiny.en` / `base.en` / `small.en` / `medium.en` |
+| `SILENCE_END_MS` | `350` | Trailing silence required to end an utterance |
 
 ## Notes
 
 - The first run downloads the Whisper and Silero models (a few hundred MB).
-- Latency is dominated by the TTS round-trip; ElevenLabs streaming endpoints are a natural next step for lower end-to-end delay.
+- End-to-end latency from "you stop speaking" to "you hear the transformed voice" is typically 600–900ms on a GPU machine with `tiny.en` + `flash_v2_5`.
 - `test.wav` is a sample input clip for offline testing.
