@@ -145,7 +145,6 @@ class VoiceTransformer:
         self.silence_buffer: list[np.ndarray] = []
 
         self.in_speech = False
-        self.silent_blocks_since_speech = 0
         self.processing_lock = asyncio.Lock()
 
     def audio_callback(self, indata, frames, time_info, status):
@@ -226,14 +225,7 @@ class VoiceTransformer:
         cfg = self.config
         silence_buffer_size = int(cfg.buffer_before_speech / cfg.block_duration)
         rolling_buffer_blocks = int(cfg.rolling_buffer_seconds / cfg.block_duration)
-        silence_end_blocks = max(
-            1, int((cfg.silence_end_ms / 1000.0) / cfg.block_duration)
-        )
-        min_speech_blocks = max(
-            1, int(cfg.min_speech_duration / cfg.block_duration)
-        )
-
-        speech_block_count = 0
+        silence_end_seconds = cfg.silence_end_ms / 1000.0
 
         print("Listening...")
         while True:
@@ -256,45 +248,37 @@ class VoiceTransformer:
                 if self.processing_lock.locked():
                     continue
 
-                # Per-block VAD on just the latest chunk — this gives us a
-                # binary "is there speech in this block" signal we can use
-                # to detect the trailing-silence endpoint.
-                block_has_speech = bool(
-                    get_speech_timestamps(
-                        audio_mono,
-                        self.vad_model,
-                        sampling_rate=cfg.sample_rate,
-                        threshold=cfg.vad_threshold,
-                    )
+                # VAD needs a multi-second window to classify reliably, so we
+                # always run it on the full rolling buffer and use the position
+                # of the last detected speech segment to decide if speech is
+                # still happening or has ended.
+                audio_concat = np.concatenate(self.vad_buffer)
+                speech_segments = get_speech_timestamps(
+                    audio_concat,
+                    self.vad_model,
+                    sampling_rate=cfg.sample_rate,
+                    threshold=cfg.vad_threshold,
+                    return_seconds=True,
+                    min_speech_duration_ms=int(cfg.min_speech_duration * 1000),
                 )
 
-                if block_has_speech:
-                    self.in_speech = True
-                    self.silent_blocks_since_speech = 0
-                    speech_block_count += 1
-                    continue
-
-                if not self.in_speech:
-                    continue
-
-                self.silent_blocks_since_speech += 1
-                if self.silent_blocks_since_speech < silence_end_blocks:
-                    continue
-
-                # Endpoint: we've seen enough trailing silence after speech.
-                if speech_block_count < min_speech_blocks:
-                    # Too short — likely a cough or a stray sound. Reset.
+                if not speech_segments:
                     self.in_speech = False
-                    self.silent_blocks_since_speech = 0
-                    speech_block_count = 0
-                    self.vad_buffer = []
                     continue
 
-                self.in_speech = False
-                self.silent_blocks_since_speech = 0
-                speech_block_count = 0
+                self.in_speech = True
+                last_segment = speech_segments[-1]
+                buffer_duration = len(audio_concat) / cfg.sample_rate
+                trailing_silence = buffer_duration - last_segment["end"]
 
-                segment_audio = self._extract_full_buffer()
+                if trailing_silence < silence_end_seconds:
+                    continue
+
+                # Endpoint: enough trailing silence after the last speech segment.
+                self.in_speech = False
+                segment_audio = self._extract_speech_audio(
+                    audio_concat, speech_segments
+                )
                 asyncio.create_task(self.transcribe_and_speak(segment_audio))
                 self.vad_buffer = []
 
@@ -303,27 +287,42 @@ class VoiceTransformer:
                 traceback.print_exc()
                 await asyncio.sleep(0.1)
 
-    def _extract_full_buffer(self) -> np.ndarray:
-        """Concatenate the pre-roll silence buffer + the rolling speech buffer.
+    def _extract_speech_audio(
+        self,
+        audio_concat: np.ndarray,
+        speech_segments: list,
+    ) -> np.ndarray:
+        """Cut from the start of the first segment (with pre-roll) to the end
+        of the last segment, so we don't send trailing silence to Whisper."""
+        cfg = self.config
+        first_start = speech_segments[0]["start"]
+        last_end = speech_segments[-1]["end"]
 
-        The pre-roll prevents clipping the first phoneme; the rolling buffer
-        contains everything from speech start through the trailing silence.
-        """
-        prefix = (
+        start_sample = max(
+            0,
+            int(first_start * cfg.sample_rate)
+            - int(cfg.buffer_before_speech * cfg.sample_rate),
+        )
+        end_sample = min(int(last_end * cfg.sample_rate), len(audio_concat))
+
+        if start_sample > 0:
+            return audio_concat[start_sample:end_sample]
+
+        # Pre-roll spills into the silence_buffer (audio that's older than
+        # the rolling VAD buffer) — pull from there to avoid clipping the
+        # first phoneme.
+        silence_audio = (
             np.concatenate(self.silence_buffer)
             if self.silence_buffer
             else np.zeros(0, dtype=np.float32)
         )
-        body = (
-            np.concatenate(self.vad_buffer)
-            if self.vad_buffer
-            else np.zeros(0, dtype=np.float32)
+        silence_needed = min(
+            len(silence_audio),
+            int(cfg.buffer_before_speech * cfg.sample_rate),
         )
-        prefix_samples = int(
-            self.config.buffer_before_speech * self.config.sample_rate
+        return np.concatenate(
+            [silence_audio[-silence_needed:], audio_concat[:end_sample]]
         )
-        prefix = prefix[-prefix_samples:] if len(prefix) > prefix_samples else prefix
-        return np.concatenate([prefix, body])
 
     def run(self) -> None:
         loop = asyncio.new_event_loop()
