@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import sounddevice as sd
@@ -16,6 +16,12 @@ from silero_vad import get_speech_timestamps, load_silero_vad
 
 import edge_tts
 from elevenlabs.client import ElevenLabs
+
+
+@dataclass
+class Voice:
+    name: str
+    voice_id: str
 
 
 @dataclass
@@ -32,6 +38,20 @@ class Config:
     eleven_voice_id: str = ""
     eleven_model_id: str = "eleven_multilingual_v2"
     eleven_api_key: str = ""
+    voices: list[Voice] = field(default_factory=list)
+
+
+def parse_voices(raw: str) -> list[Voice]:
+    voices: list[Voice] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        name, voice_id = entry.split(":", 1)
+        name, voice_id = name.strip(), voice_id.strip()
+        if name and voice_id:
+            voices.append(Voice(name=name, voice_id=voice_id))
+    return voices
 
 
 def load_config() -> Config:
@@ -43,7 +63,35 @@ def load_config() -> Config:
         eleven_voice_id=os.environ.get("ELEVEN_VOICE_ID", ""),
         eleven_model_id=os.environ.get("ELEVEN_MODEL_ID", "eleven_multilingual_v2"),
         eleven_api_key=os.environ.get("ELEVEN_API_KEY", ""),
+        voices=parse_voices(os.environ.get("ELEVEN_VOICES", "")),
     )
+
+
+def pick_voice(config: Config) -> str:
+    if not config.voices:
+        if not config.eleven_voice_id:
+            raise RuntimeError(
+                "No voices configured. Set ELEVEN_VOICES (recommended) or "
+                "ELEVEN_VOICE_ID in your .env."
+            )
+        return config.eleven_voice_id
+
+    print("\nAvailable voices:")
+    for i, voice in enumerate(config.voices):
+        print(f"  {i}: {voice.name}")
+    while True:
+        raw = input(
+            f"Choose voice index (blank for 0 — {config.voices[0].name}): "
+        ).strip()
+        if not raw:
+            return config.voices[0].voice_id
+        try:
+            idx = int(raw)
+            if 0 <= idx < len(config.voices):
+                return config.voices[idx].voice_id
+        except ValueError:
+            pass
+        print(f"Enter a number 0–{len(config.voices) - 1}.")
 
 
 def detect_device() -> tuple[str, str]:
@@ -58,8 +106,14 @@ def detect_device() -> tuple[str, str]:
 
 
 class VoiceTransformer:
-    def __init__(self, config: Config, output_device_idx: int | None = None):
+    def __init__(
+        self,
+        config: Config,
+        voice_id: str,
+        output_device_idx: int | None = None,
+    ):
         self.config = config
+        self.voice_id = voice_id
         self.output_device_idx = output_device_idx
 
         device, compute_type = detect_device()
@@ -75,10 +129,6 @@ class VoiceTransformer:
                 raise RuntimeError(
                     "USE_ELEVENLABS=true but ELEVEN_API_KEY is not set. "
                     "Add it to your .env file."
-                )
-            if not config.eleven_voice_id:
-                raise RuntimeError(
-                    "USE_ELEVENLABS=true but ELEVEN_VOICE_ID is not set."
                 )
             self.eleven_client = ElevenLabs(api_key=config.eleven_api_key)
 
@@ -107,7 +157,7 @@ class VoiceTransformer:
         assert self.eleven_client is not None
         audio_generator = self.eleven_client.text_to_speech.convert(
             text=text,
-            voice_id=self.config.eleven_voice_id,
+            voice_id=self.voice_id,
             model_id=self.config.eleven_model_id,
         )
         return b"".join(audio_generator)
@@ -268,7 +318,11 @@ def main() -> None:
     raw = input("Choose output device index (blank for system default): ").strip()
     output_device_idx = int(raw) if raw else None
 
-    transformer = VoiceTransformer(config, output_device_idx=output_device_idx)
+    voice_id = pick_voice(config) if config.use_elevenlabs else ""
+
+    transformer = VoiceTransformer(
+        config, voice_id=voice_id, output_device_idx=output_device_idx
+    )
     transformer.run()
 
 
