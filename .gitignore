@@ -6,6 +6,7 @@ venv/
 env/
 .env
 .env.local
+vocab.txt
 *.wav
 !test.wav
 *.mp3
