@@ -2,10 +2,12 @@ import asyncio
 import io
 import os
 import queue
+import re
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
@@ -31,6 +33,20 @@ class Voice:
 
 
 @dataclass
+class Vocab:
+    # Plain words/phrases passed to Whisper's initial_prompt to bias decoding
+    # toward this vocabulary.
+    bias_terms: list[str] = field(default_factory=list)
+    # (compiled_pattern, replacement) pairs applied to the transcript after
+    # Whisper runs. Pattern is case-insensitive whole-word(s) match.
+    substitutions: list[tuple[re.Pattern, str]] = field(default_factory=list)
+
+    @property
+    def initial_prompt(self) -> str:
+        return ", ".join(self.bias_terms) if self.bias_terms else ""
+
+
+@dataclass
 class Config:
     sample_rate: int = 16000
     block_duration: float = 0.25
@@ -46,7 +62,10 @@ class Config:
     eleven_voice_id: str = ""
     eleven_model_id: str = "eleven_flash_v2_5"
     eleven_api_key: str = ""
+    vocab_file: str = "vocab.txt"
+    carry_inflection: bool = False
     voices: list[Voice] = field(default_factory=list)
+    vocab: Vocab = field(default_factory=Vocab)
 
 
 def parse_voices(raw: str) -> list[Voice]:
@@ -62,8 +81,37 @@ def parse_voices(raw: str) -> list[Voice]:
     return voices
 
 
+def load_vocab(path: str) -> Vocab:
+    p = Path(path)
+    if not p.exists():
+        return Vocab()
+
+    bias_terms: list[str] = []
+    substitutions: list[tuple[re.Pattern, str]] = []
+    for raw_line in p.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "->" in line:
+            wrong, right = line.split("->", 1)
+            wrong, right = wrong.strip(), right.strip()
+            if not wrong or not right:
+                continue
+            # Whole-token match so "AI" doesn't replace inside "again".
+            pattern = re.compile(rf"\b{re.escape(wrong)}\b", re.IGNORECASE)
+            substitutions.append((pattern, right))
+            # Also seed the bias prompt with the right-hand spelling so
+            # Whisper has a chance to produce it directly.
+            bias_terms.append(right)
+        else:
+            bias_terms.append(line)
+
+    return Vocab(bias_terms=bias_terms, substitutions=substitutions)
+
+
 def load_config() -> Config:
     load_dotenv()
+    vocab_file = os.environ.get("VOCAB_FILE", "vocab.txt")
     return Config(
         whisper_model=os.environ.get("WHISPER_MODEL", "tiny.en"),
         edge_voice=os.environ.get("EDGE_VOICE", "en-US-GuyNeural"),
@@ -74,6 +122,9 @@ def load_config() -> Config:
         eleven_api_key=os.environ.get("ELEVEN_API_KEY", ""),
         voices=parse_voices(os.environ.get("ELEVEN_VOICES", "")),
         silence_end_ms=int(os.environ.get("SILENCE_END_MS", "350")),
+        vocab_file=vocab_file,
+        vocab=load_vocab(vocab_file),
+        carry_inflection=os.environ.get("CARRY_INFLECTION", "false").lower() == "true",
     )
 
 
@@ -104,6 +155,122 @@ def pick_voice(config: Config) -> str:
         print(f"Enter a number 0–{len(config.voices) - 1}.")
 
 
+def estimate_pitch_hz(audio: np.ndarray, sr: int) -> float:
+    """Autocorrelation-based pitch estimate. Returns 0.0 if unvoiced.
+
+    Cheap and good enough for "did pitch rise at the end of the utterance" —
+    not for music. Searches the typical human speech range (75–400 Hz).
+    """
+    if len(audio) < sr // 20:
+        return 0.0
+    audio = audio - audio.mean()
+    if audio.std() < 0.01:
+        return 0.0
+    min_lag = sr // 400
+    max_lag = sr // 75
+    if max_lag >= len(audio):
+        return 0.0
+    corr = np.correlate(audio, audio, mode="full")[len(audio) - 1 :]
+    corr = corr[min_lag:max_lag]
+    if corr.size == 0 or corr.max() <= 0:
+        return 0.0
+    peak_lag = int(np.argmax(corr)) + min_lag
+    return float(sr) / peak_lag
+
+
+@dataclass
+class Prosody:
+    is_question: bool = False
+    pause_indices: list[int] = field(default_factory=list)  # word indices that get a pause inserted *before* them
+    emphasis_indices: set[int] = field(default_factory=set)  # word indices to emphasize
+    rate: float = 1.0  # 1.0 = normal, <1 = slower, >1 = faster
+
+
+def analyze_prosody(
+    audio: np.ndarray,
+    sr: int,
+    word_timings: list[tuple[str, float, float]],
+) -> Prosody:
+    """Extract simple prosodic features from the audio + Whisper word timings.
+
+    word_timings is a list of (word, start_seconds, end_seconds).
+    """
+    prosody = Prosody()
+    if not word_timings or len(audio) < sr // 4:
+        return prosody
+
+    # 1. Question intonation: compare pitch in the last ~25% vs middle ~25%.
+    n = len(audio)
+    mid_a, mid_b = int(n * 0.4), int(n * 0.65)
+    end_a, end_b = int(n * 0.75), n
+    pitch_mid = estimate_pitch_hz(audio[mid_a:mid_b], sr)
+    pitch_end = estimate_pitch_hz(audio[end_a:end_b], sr)
+    if pitch_mid > 50 and pitch_end > 50 and pitch_end > pitch_mid * 1.15:
+        prosody.is_question = True
+
+    # 2. Per-word RMS energy → emphasis. Words >1.5 stdev above mean stand out.
+    energies = []
+    for _, start, end in word_timings:
+        s, e = int(start * sr), int(end * sr)
+        s, e = max(0, s), min(n, e)
+        if e <= s:
+            energies.append(0.0)
+            continue
+        seg = audio[s:e]
+        energies.append(float(np.sqrt(np.mean(seg * seg))))
+    if energies:
+        arr = np.array(energies)
+        if arr.std() > 1e-4:
+            threshold = arr.mean() + 1.5 * arr.std()
+            for i, e in enumerate(energies):
+                if e >= threshold and len(word_timings[i][0].strip()) > 1:
+                    prosody.emphasis_indices.add(i)
+
+    # 3. Pauses: gaps between consecutive words >250ms.
+    for i in range(1, len(word_timings)):
+        gap = word_timings[i][1] - word_timings[i - 1][2]
+        if gap >= 0.25:
+            prosody.pause_indices.append(i)
+
+    # 4. Speaking rate: chars per second. Normal English ≈ 14–16 chps.
+    total_chars = sum(len(w[0]) for w in word_timings)
+    total_sec = word_timings[-1][2] - word_timings[0][1]
+    if total_sec > 0.3 and total_chars > 0:
+        chps = total_chars / total_sec
+        prosody.rate = max(0.7, min(1.3, chps / 15.0))
+
+    return prosody
+
+
+def render_with_prosody(
+    word_timings: list[tuple[str, float, float]],
+    prosody: Prosody,
+) -> str:
+    """Reassemble the transcript with prosodic cues embedded as punctuation
+    and capitalization. We avoid SSML because Flash v2.5 only partially
+    honors it — punctuation and casing are universally respected by TTS."""
+    if not word_timings:
+        return ""
+    parts: list[str] = []
+    for i, (word, _, _) in enumerate(word_timings):
+        token = word.strip()
+        if not token:
+            continue
+        if i in prosody.pause_indices and parts:
+            parts.append("...")
+        if i in prosody.emphasis_indices:
+            # Capitalize the alphabetic part to cue emphasis without breaking
+            # punctuation already attached by Whisper.
+            token = "".join(c.upper() if c.isalpha() else c for c in token)
+        parts.append(token)
+    text = " ".join(parts)
+
+    # Question mark: only add if not already terminal punctuation.
+    if prosody.is_question and text and text[-1] not in "?!.":
+        text = text.rstrip(",;:") + "?"
+    return text
+
+
 def detect_device() -> tuple[str, str]:
     try:
         import torch
@@ -131,6 +298,14 @@ class VoiceTransformer:
         self.whisper = WhisperModel(
             config.whisper_model, device=device, compute_type=compute_type
         )
+        if config.vocab.bias_terms or config.vocab.substitutions:
+            print(
+                f"Loaded vocab from {config.vocab_file}: "
+                f"{len(config.vocab.bias_terms)} bias terms, "
+                f"{len(config.vocab.substitutions)} substitutions"
+            )
+        if config.carry_inflection:
+            print("Inflection carryover: ON (questions, pauses, emphasis)")
         self.vad_model = load_silero_vad()
 
         self.eleven_client: ElevenLabs | None = None
@@ -149,15 +324,9 @@ class VoiceTransformer:
         self.in_speech = False
         self.processing_lock = asyncio.Lock()
 
-        # Suppresses mic input while TTS is playing so the synthesized voice
-        # doesn't get fed back through the mic and re-transcribed.
-        self.muting_until = 0.0
-
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             print(f"Audio status: {status}")
-        if time.time() < self.muting_until:
-            return
         self.audio_queue.put(indata.copy())
 
     def stream_pcm_playback(self, stream, pcm_chunks, t_request_sent: float) -> None:
@@ -182,12 +351,6 @@ class VoiceTransformer:
 
     async def synthesize_and_play_elevenlabs(self, text: str) -> None:
         assert self.eleven_client is not None
-        # Mute the mic for the full TTS lifecycle. We extend muting_until
-        # while playback runs and add a small grace period after, so the
-        # tail of the synthesized voice can't bleed into the mic and
-        # trigger a feedback loop.
-        self.muting_until = time.time() + 60  # extended each chunk below
-
         # Pre-open the output device so playback starts the instant the
         # first network chunk arrives — opening lazily on first write()
         # would add 50–150ms on Windows.
@@ -227,19 +390,6 @@ class VoiceTransformer:
         finally:
             out_stream.stop()
             out_stream.close()
-            # Grace period after playback ends: drop any mic frames that
-            # are still echoing the tail of the synthesized audio, then
-            # also discard anything queued during muting so the next loop
-            # iteration starts clean.
-            self.muting_until = time.time() + 0.3
-            await asyncio.sleep(0.3)
-            while not self.audio_queue.empty():
-                try:
-                    self.audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-            self.vad_buffer = []
-            self.silence_buffer = []
 
     async def synthesize_and_play_edge(self, text: str) -> None:
         tts = edge_tts.Communicate(text, self.config.edge_voice)
@@ -259,13 +409,47 @@ class VoiceTransformer:
         async with self.processing_lock:
             try:
                 t0 = time.time()
-                segments, _ = self.whisper.transcribe(audio_np, beam_size=1)
-                text = " ".join(seg.text.strip() for seg in segments).strip()
+                vocab = self.config.vocab
+                carry = self.config.carry_inflection
+                transcribe_kwargs = {"beam_size": 1}
+                if vocab.initial_prompt:
+                    transcribe_kwargs["initial_prompt"] = vocab.initial_prompt
+                if carry:
+                    transcribe_kwargs["word_timestamps"] = True
+                segments, _ = self.whisper.transcribe(audio_np, **transcribe_kwargs)
+
+                if carry:
+                    word_timings: list[tuple[str, float, float]] = []
+                    for seg in segments:
+                        for w in (seg.words or []):
+                            word_timings.append((w.word, w.start, w.end))
+                    prosody = analyze_prosody(
+                        audio_np, self.config.sample_rate, word_timings
+                    )
+                    text = render_with_prosody(word_timings, prosody)
+                else:
+                    text = " ".join(seg.text.strip() for seg in segments).strip()
+
+                for pattern, replacement in vocab.substitutions:
+                    text = pattern.sub(replacement, text)
                 t_stt = time.time() - t0
                 if not text:
                     return
 
-                print(f"Transcribed ({t_stt * 1000:.0f}ms): {text}")
+                if carry:
+                    cues = []
+                    if prosody.is_question:
+                        cues.append("?")
+                    if prosody.emphasis_indices:
+                        cues.append(f"emph={len(prosody.emphasis_indices)}")
+                    if prosody.pause_indices:
+                        cues.append(f"pauses={len(prosody.pause_indices)}")
+                    if abs(prosody.rate - 1.0) > 0.05:
+                        cues.append(f"rate={prosody.rate:.2f}")
+                    cue_str = f" [{', '.join(cues)}]" if cues else ""
+                    print(f"Transcribed ({t_stt * 1000:.0f}ms){cue_str}: {text}")
+                else:
+                    print(f"Transcribed ({t_stt * 1000:.0f}ms): {text}")
 
                 t1 = time.time()
                 if self.config.use_elevenlabs:

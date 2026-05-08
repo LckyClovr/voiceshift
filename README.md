@@ -55,6 +55,48 @@ All settings are env vars (see `.env.example`):
 | `EDGE_VOICE` | `en-US-GuyNeural` | Used only with Edge TTS |
 | `WHISPER_MODEL` | `tiny.en` | `tiny.en` / `base.en` / `small.en` / `medium.en` |
 | `SILENCE_END_MS` | `350` | Trailing silence required to end an utterance |
+| `VOCAB_FILE` | `vocab.txt` | Custom vocabulary file (see below) |
+| `CARRY_INFLECTION` | `false` | Detect and carry over prosody (see below) |
+
+## Custom vocabulary
+
+VoiceShift loads `vocab.txt` at startup to bias Whisper toward proper nouns, jargon, brand names, or slang it would otherwise mishear. The file is gitignored so each user can keep their own.
+
+Two line types:
+
+- **Bias term** — a plain word/phrase, passed to Whisper's `initial_prompt`. Whisper is more likely to produce this spelling, but it's a soft hint, not a guarantee.
+- **Substitution** — `wrong -> right` forces a literal replacement on the transcript after Whisper runs. Match is case-insensitive and whole-word; replacement preserves your right-hand casing. The right-hand spelling is also added to the bias prompt automatically.
+
+```
+# vocab.txt
+ElevenLabs
+faster-whisper
+voice shift -> VoiceShift
+11 labs -> ElevenLabs
+```
+
+Lines starting with `#` and blank lines are ignored. On startup you'll see `Loaded vocab from vocab.txt: N bias terms, M substitutions` confirming it loaded. Use `VOCAB_FILE=path/to/file.txt` in `.env` to point at a different file.
+
+Tip: if a term keeps getting mangled even after adding a bias entry, check what Whisper is actually outputting and add a `wrong -> right` substitution for that exact mishear.
+
+## Inflection carryover
+
+Set `CARRY_INFLECTION=true` to have VoiceShift extract simple prosodic features from your audio and inject them into the text sent to TTS so the synthesized voice mirrors your delivery. Adds ~10–30ms per utterance.
+
+What gets carried over:
+
+- **Questions** — rising pitch in the last ~25% of the utterance vs the middle adds a `?`.
+- **Pauses** — gaps >250ms between words become `...` so the TTS pauses there too.
+- **Emphasis** — words >1.5σ above mean RMS energy get capitalized so the TTS stresses them.
+- **Speaking rate** — measured but currently only logged; reserved for SSML wiring.
+
+This is an *approximation*, not full prosody transfer. You'll get question intonation, pauses, and rough emphasis, but not your melodic contour, micro-timing, or vocal texture. For genuine inflection transfer, use ElevenLabs' Speech-to-Speech endpoint instead (separate code path, not yet wired up).
+
+When on, transcripts log with the detected cues, e.g.:
+
+```
+Transcribed (180ms) [?, emph=1, pauses=2]: are you SERIOUS ... right now?
+```
 
 ## Notes
 
