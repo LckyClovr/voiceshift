@@ -676,6 +676,7 @@ class VoiceTransformer:
                     await self.synthesize_and_play_edge(text)
                 t_tts = time.time() - t1
                 print(f"  TTS+playback: {t_tts * 1000:.0f}ms")
+                self.print_voice_menu()
             except Exception:
                 print("Error in transcription/synthesis:")
                 traceback.print_exc()
@@ -687,6 +688,7 @@ class VoiceTransformer:
         silence_end_seconds = cfg.silence_end_ms / 1000.0
 
         print("Listening...")
+        self.print_voice_menu()
         while True:
             try:
                 if self.audio_queue.empty():
@@ -783,6 +785,19 @@ class VoiceTransformer:
             [silence_audio[-silence_needed:], audio_concat[:end_sample]]
         )
 
+    def print_voice_menu(self) -> None:
+        """Print the voice list with the active voice marked. Called
+        after every transcription cycle so the menu is always the most
+        recent thing on screen and reminds you of the index numbers."""
+        voices = self.config.voices
+        if not voices:
+            return
+        labels = []
+        for i, v in enumerate(voices):
+            marker = "*" if v.voice_id == self.voice_id else " "
+            labels.append(f"{marker}{i}:{v.name}")
+        print("[Voices] " + "  ".join(labels) + "   (type number+Enter)")
+
     def switch_voice(self, idx: int) -> None:
         voices = self.config.voices
         if not (0 <= idx < len(voices)):
@@ -794,15 +809,12 @@ class VoiceTransformer:
             return
         self.voice_id = chosen.voice_id
         print(f"  -> switched to voice {idx}: {chosen.name}")
+        self.print_voice_menu()
 
     def voice_switch_thread(self) -> None:
         voices = self.config.voices
         if not voices:
             return
-        print("\nVoice switch: type a number + Enter to change voice mid-session.")
-        for i, v in enumerate(voices):
-            print(f"  {i}: {v.name}")
-        print()
         while True:
             try:
                 raw = input().strip()
