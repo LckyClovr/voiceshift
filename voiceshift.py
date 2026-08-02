@@ -3,11 +3,28 @@ import io
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# NVIDIA's Windows wheels keep their runtime DLLs inside site-packages instead
+# of adding them to the system PATH. Register those directories before
+# CTranslate2 initializes CUDA so VoiceShift remains self-contained in its
+# virtual environment.
+_cuda_dll_handles = []
+if os.name == "nt" and hasattr(os, "add_dll_directory"):
+    nvidia_dir = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    for package in ("cublas", "cudnn", "cuda_nvrtc"):
+        dll_dir = nvidia_dir / package / "bin"
+        if dll_dir.is_dir():
+            # CTranslate2 loads CUDA libraries dynamically by filename, which
+            # consults PATH rather than only Python's extension-module paths.
+            os.environ["PATH"] = f"{dll_dir}{os.pathsep}{os.environ['PATH']}"
+            _cuda_dll_handles.append(os.add_dll_directory(str(dll_dir)))
 
 import numpy as np
 import sounddevice as sd
@@ -479,11 +496,11 @@ def render_with_prosody(
 
 def detect_device() -> tuple[str, str]:
     try:
-        import torch
+        import ctranslate2
 
-        if torch.cuda.is_available():
+        if ctranslate2.get_cuda_device_count() > 0:
             return "cuda", "float16"
-    except ImportError:
+    except (ImportError, RuntimeError):
         pass
     return "cpu", "int8"
 

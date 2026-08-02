@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# GPU runtime used by CTranslate2/faster-whisper on Windows.
+nvidia-cublas-cu12>=12.9,<13
+nvidia-cudnn-cu12>=9,<10

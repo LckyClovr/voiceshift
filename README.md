@@ -31,7 +31,10 @@ On startup VoiceShift prompts for an output device, then for a voice from the li
 
 **Switching voices mid-session:** while VoiceShift is running, type a voice index (e.g. `2`) and press Enter to swap voices for the next utterance — no restart needed. The list of available indices is printed when the app starts.
 
-For GPU acceleration, install a CUDA-enabled build of PyTorch separately; otherwise it falls back to CPU with `int8` quantization.
+For GPU acceleration on Windows, install the CUDA runtime dependencies with
+`pip install -r requirements-cuda.txt`. VoiceShift detects CUDA through
+CTranslate2 and uses `float16` inference; otherwise it falls back to CPU with
+`int8` quantization.
 
 ## Configuring your voice library
 
